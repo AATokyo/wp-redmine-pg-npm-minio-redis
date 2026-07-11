@@ -1,0 +1,228 @@
+services:
+  db:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      POSTGRES_DB: ${POSTGRES_DB:-wordpress}
+      POSTGRES_USER: ${POSTGRES_USER:-wordpress}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wordpress}
+    volumes:
+      - db-data-pg18-root:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-wordpress} -d ${POSTGRES_DB:-wordpress}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin123}
+    command: server /data --console-address ":9001"
+    expose:
+      - "9000"
+      - "9001"
+    volumes:
+      - minio-data:/data
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_started
+    restart: "no"
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin123}; do sleep 2; done;
+      mc mb -p local/${S3_UPLOADS_BUCKET:-wordpress-uploads} || true;
+      mc anonymous set download local/${S3_UPLOADS_BUCKET:-wordpress-uploads} || true;
+      "
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  npm-db-init:
+    image: postgres:18-alpine
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      POSTGRES_HOST: db
+      POSTGRES_USER: ${POSTGRES_USER:-wordpress}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wordpress}
+      NPM_DB_NAME: ${NPM_DB_NAME:-npm}
+      NPM_DB_OWNER: ${NPM_DB_OWNER:-wordpress}
+    entrypoint: >
+      /bin/sh -c "
+      export PGPASSWORD=\"${POSTGRES_PASSWORD:-wordpress}\";
+      until psql -h db -U \"${POSTGRES_USER:-wordpress}\" -d postgres -c 'select 1' >/dev/null 2>&1; do sleep 2; done;
+      if ! psql -h db -U \"${POSTGRES_USER:-wordpress}\" -d postgres -tAc \"SELECT 1 FROM pg_database WHERE datname = '${NPM_DB_NAME:-npm}'\" | grep -q 1; then
+        psql -h db -U \"${POSTGRES_USER:-wordpress}\" -d postgres -c \"CREATE DATABASE ${NPM_DB_NAME:-npm} OWNER ${NPM_DB_OWNER:-wordpress};\";
+      fi;
+      "
+
+  redmine-db-init:
+    image: postgres:18-alpine
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      POSTGRES_HOST: db
+      POSTGRES_USER: ${POSTGRES_USER:-wordpress}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wordpress}
+      REDMINE_DB_NAME: ${REDMINE_DB_NAME:-redmine}
+      REDMINE_DB_USER: ${REDMINE_DB_USER:-redmine}
+      REDMINE_DB_PASSWORD: ${REDMINE_DB_PASSWORD:-redmine}
+    entrypoint: >
+      /bin/sh -c "
+      export PGPASSWORD=\"${POSTGRES_PASSWORD:-wordpress}\";
+      until psql -h db -U \"${POSTGRES_USER:-wordpress}\" -d postgres -c 'select 1' >/dev/null 2>&1; do sleep 2; done;
+      if ! psql -h db -U \"${POSTGRES_USER:-wordpress}\" -d postgres -tAc \"SELECT 1 FROM pg_roles WHERE rolname = '${REDMINE_DB_USER:-redmine}'\" | grep -q 1; then
+        psql -h db -U \"${POSTGRES_USER:-wordpress}\" -d postgres -c \"CREATE ROLE ${REDMINE_DB_USER:-redmine} LOGIN PASSWORD '${REDMINE_DB_PASSWORD:-redmine}';\";
+      fi;
+      if ! psql -h db -U \"${POSTGRES_USER:-wordpress}\" -d postgres -tAc \"SELECT 1 FROM pg_database WHERE datname = '${REDMINE_DB_NAME:-redmine}'\" | grep -q 1; then
+        psql -h db -U \"${POSTGRES_USER:-wordpress}\" -d postgres -c \"CREATE DATABASE ${REDMINE_DB_NAME:-redmine} OWNER ${REDMINE_DB_USER:-redmine};\";
+      fi;
+      "
+
+  redmine:
+    build:
+      context: ./redmine
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redmine-db-init:
+        condition: service_completed_successfully
+    expose:
+      - "80"
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      DB_ADAPTER: postgresql
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: ${REDMINE_DB_NAME:-redmine}
+      DB_USER: ${REDMINE_DB_USER:-redmine}
+      DB_PASS: ${REDMINE_DB_PASSWORD:-redmine}
+      DB_ENCODING: ${REDMINE_DB_ENCODING:-utf8}
+      REDMINE_HTTPS: ${REDMINE_HTTPS:-true}
+      REDMINE_RELATIVE_URL_ROOT: ${REDMINE_RELATIVE_URL_ROOT:-}
+      REDMINE_SECRET_KEY_BASE: ${REDMINE_SECRET_KEY_BASE:-change-me-in-production}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-minioadmin}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-minioadmin123}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_BUCKET: ${REDMINE_S3_BUCKET:-redmine}
+      S3_PATH: ${REDMINE_S3_PATH:-redmine/files}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      S3_FORCE_PATH_STYLE: ${S3_FORCE_PATH_STYLE:-true}
+    volumes:
+      - redmine-data:/home/redmine/data
+      - redmine-logs:/var/log/redmine
+
+  npm:
+    image: jc21/nginx-proxy-manager:latest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      npm-db-init:
+        condition: service_completed_successfully
+      wordpress:
+        condition: service_started
+      redmine:
+        condition: service_started
+    ports:
+      - "80:80"
+      - "81:81"
+      - "443:443"
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      DB_POSTGRES_HOST: db
+      DB_POSTGRES_PORT: 5432
+      DB_POSTGRES_USER: ${POSTGRES_USER:-wordpress}
+      DB_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wordpress}
+      DB_POSTGRES_NAME: ${NPM_DB_NAME:-npm}
+      DISABLE_IPV6: ${NPM_DISABLE_IPV6:-true}
+    volumes:
+      - npm-data:/data
+      - npm-letsencrypt:/etc/letsencrypt
+
+  wordpress:
+    build:
+      context: .
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    expose:
+      - "80"
+    environment:
+      TZ: ${TZ:-Asia/Tokyo}
+      WORDPRESS_DB_HOST: db:5432
+      WORDPRESS_DB_NAME: ${POSTGRES_DB:-wordpress}
+      WORDPRESS_DB_USER: ${POSTGRES_USER:-wordpress}
+      WORDPRESS_DB_PASSWORD: ${POSTGRES_PASSWORD:-wordpress}
+      WORDPRESS_AUTO_INSTALL: ${WORDPRESS_AUTO_INSTALL:-false}
+      WP_PGSQL_DEBUG: ${WP_PGSQL_DEBUG:-false}
+      PGSSLMODE: disable
+      WORDPRESS_URL: ${WORDPRESS_URL:-http://localhost}
+      WORDPRESS_SITE_TITLE: ${WORDPRESS_SITE_TITLE:-WordPress Local}
+      WORDPRESS_ADMIN_USER: ${WORDPRESS_ADMIN_USER:-admin}
+      WORDPRESS_ADMIN_PASSWORD: ${WORDPRESS_ADMIN_PASSWORD:-admin}
+      WORDPRESS_ADMIN_EMAIL: ${WORDPRESS_ADMIN_EMAIL:-admin@example.com}
+      WORDPRESS_TIMEZONE: ${WORDPRESS_TIMEZONE:-Asia/Tokyo}
+      S3_UPLOADS_BUCKET: ${S3_UPLOADS_BUCKET:-wordpress-uploads}
+      S3_UPLOADS_REGION: ${S3_UPLOADS_REGION:-us-east-1}
+      S3_UPLOADS_KEY: ${S3_UPLOADS_KEY:-minioadmin}
+      S3_UPLOADS_SECRET: ${S3_UPLOADS_SECRET:-minioadmin123}
+      S3_UPLOADS_ENDPOINT: ${S3_UPLOADS_ENDPOINT:-http://minio:9000}
+      S3_UPLOADS_PATH_STYLE: ${S3_UPLOADS_PATH_STYLE:-true}
+      S3_UPLOADS_CHECKSUM_MODE: ${S3_UPLOADS_CHECKSUM_MODE:-when_required}
+      S3_UPLOADS_BUCKET_URL: ${S3_UPLOADS_BUCKET_URL:-}
+      S3_UPLOADS_OBJECT_ACL: ${S3_UPLOADS_OBJECT_ACL:-public-read}
+      WP_REDIS_HOST: ${WP_REDIS_HOST:-redis}
+      WP_REDIS_PORT: ${WP_REDIS_PORT:-6379}
+      WP_REDIS_DATABASE: ${WP_REDIS_DATABASE:-0}
+      WP_REDIS_PREFIX: ${WP_REDIS_PREFIX:-wp}
+      WORDPRESS_CONFIG_EXTRA: |
+        define( 'DB_ENGINE', 'pgsql' );
+        require_once ABSPATH . 'wp-content/wp-config-secrets.php';
+    volumes:
+      - wordpress-content:/var/www/html/wp-content
+
+volumes:
+  db-data-pg18-root:
+  wordpress-content:
+  minio-data:
+  redis-data:
+  npm-data:
+  npm-letsencrypt:
+  redmine-data:
+  redmine-logs:
